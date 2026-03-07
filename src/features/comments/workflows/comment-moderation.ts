@@ -9,7 +9,10 @@ import { sendReplyNotification } from "@/features/comments/workflows/helpers";
 import { AdminNotificationEmail } from "@/features/email/templates/AdminNotificationEmail";
 import { getDb } from "@/lib/db";
 import { isNotInProduction, serverEnv } from "@/lib/env/server.env";
-import { convertToPlainText } from "@/features/posts/utils/content";
+import {
+  buildContentPreview,
+  convertToPlainText,
+} from "@/features/posts/utils/content";
 
 interface Params {
   commentId: number;
@@ -29,14 +32,23 @@ export class CommentModerationWorkflow extends WorkflowEntrypoint<Env, Params> {
     });
 
     if (!comment) {
-      console.log(`Comment ${commentId} not found, skipping moderation`);
+      console.log(
+        JSON.stringify({
+          message: "comment not found, skipping moderation",
+          commentId,
+        }),
+      );
       return;
     }
 
     // Skip if comment is already processed or deleted
     if (comment.status !== "verifying") {
       console.log(
-        `Comment ${commentId} is already processed (status: ${comment.status}), skipping`,
+        JSON.stringify({
+          message: "comment already processed, skipping moderation",
+          commentId,
+          status: comment.status,
+        }),
       );
       return;
     }
@@ -50,12 +62,45 @@ export class CommentModerationWorkflow extends WorkflowEntrypoint<Env, Params> {
     });
 
     if (!post) {
-      console.log(`Post ${comment.postId} not found, skipping moderation`);
+      console.log(
+        JSON.stringify({
+          message: "post not found, skipping moderation",
+          postId: comment.postId,
+        }),
+      );
       return;
     }
 
+    const threadContext = await step.do("fetch thread context", async () => {
+      const db = getDb(this.env);
+      const [rootComment, replyToComment] = await Promise.all([
+        comment.rootId
+          ? CommentService.findCommentById(
+              { db, env: this.env },
+              comment.rootId,
+            )
+          : null,
+        comment.replyToCommentId
+          ? CommentService.findCommentById(
+              { db, env: this.env },
+              comment.replyToCommentId,
+            )
+          : null,
+      ]);
+
+      return {
+        rootCommentText: rootComment
+          ? convertToPlainText(rootComment.content).trim()
+          : "",
+        replyToCommentText: replyToComment
+          ? convertToPlainText(replyToComment.content).trim()
+          : "",
+      };
+    });
+
     // Extract plain text from JSONContent
     const plainText = convertToPlainText(comment.content);
+    const postContentPreview = buildContentPreview(post.contentJson);
 
     if (!plainText || plainText.trim().length === 0) {
       // Empty comment, mark as pending for manual review
@@ -96,12 +141,24 @@ export class CommentModerationWorkflow extends WorkflowEntrypoint<Env, Params> {
               post: {
                 title: post.title,
                 summary: post.summary ?? "",
+                contentPreview: postContentPreview,
+              },
+              thread: {
+                isReply: Boolean(comment.replyToCommentId),
+                rootComment: threadContext.rootCommentText,
+                replyToComment: threadContext.replyToCommentText,
               },
             },
           );
         } catch (error) {
           // If AI service is not configured, mark as pending for manual review
-          console.error("AI moderation failed:", error);
+          console.error(
+            JSON.stringify({
+              message: "ai moderation failed",
+              commentId,
+              error: error instanceof Error ? error.message : String(error),
+            }),
+          );
           return {
             safe: false,
             reason: "AI 审核服务暂时不可用，等待人工审核",

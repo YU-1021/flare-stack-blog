@@ -10,6 +10,7 @@ import {
   getContentTypeFromKey,
 } from "@/features/media/media.utils";
 import { CACHE_CONTROL } from "@/lib/constants";
+import { err, ok } from "@/lib/errors";
 
 export async function upload(
   context: DbContext & { executionCtx: ExecutionContext },
@@ -28,13 +29,30 @@ export async function upload(
       width,
       height,
     });
-    return mediaRecord;
+    return ok(mediaRecord);
   } catch (error) {
-    console.error("DB Insert Failed, rolling back R2 upload:", error);
-    context.executionCtx.waitUntil(
-      Storage.deleteFromR2(context.env, uploaded.key).catch(console.error),
+    console.error(
+      JSON.stringify({
+        message: "media db insert failed, rolling back r2 upload",
+        key: uploaded.key,
+        error: error instanceof Error ? error.message : String(error),
+      }),
     );
-    throw new Error("Failed to insert media record");
+    context.executionCtx.waitUntil(
+      Storage.deleteFromR2(context.env, uploaded.key).catch((rollbackError) =>
+        console.error(
+          JSON.stringify({
+            message: "r2 rollback delete failed",
+            key: uploaded.key,
+            error:
+              rollbackError instanceof Error
+                ? rollbackError.message
+                : String(rollbackError),
+          }),
+        ),
+      ),
+    );
+    return err({ reason: "MEDIA_RECORD_CREATE_FAILED" });
   }
 }
 
@@ -45,13 +63,26 @@ export async function deleteImage(
   // 后端兜底检查：防止删除正在被引用的媒体
   const inUse = await PostMediaRepo.isMediaInUse(context.db, key);
   if (inUse) {
-    throw new Error("Cannot delete media that is in use");
+    return err({ reason: "MEDIA_IN_USE" });
   }
 
   await MediaRepo.deleteMedia(context.db, key);
   context.executionCtx.waitUntil(
-    Storage.deleteFromR2(context.env, key).catch(console.error),
+    Storage.deleteFromR2(context.env, key).catch((deleteError) =>
+      console.error(
+        JSON.stringify({
+          message: "r2 delete failed",
+          key,
+          error:
+            deleteError instanceof Error
+              ? deleteError.message
+              : String(deleteError),
+        }),
+      ),
+    ),
   );
+
+  return ok({ success: true });
 }
 
 export async function getMediaList(
@@ -155,7 +186,12 @@ export async function handleImageRequest(
     // 如果变换失败 (如格式不支持)，降级回原图
     if (!response.ok) {
       console.error(
-        `Image transform failed with status ${response.status}: ${response.statusText}`,
+        JSON.stringify({
+          message: "image transform failed",
+          key,
+          status: response.status,
+          statusText: response.statusText,
+        }),
       );
       return await serveOriginal();
     }
@@ -172,7 +208,13 @@ export async function handleImageRequest(
 
     return newResponse;
   } catch (e) {
-    console.error("Image transform failed with error:", e);
+    console.error(
+      JSON.stringify({
+        message: "image transform error",
+        key,
+        error: e instanceof Error ? e.message : String(e),
+      }),
+    );
     return await serveOriginal();
   }
 }
